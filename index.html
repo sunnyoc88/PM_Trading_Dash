@@ -616,7 +616,7 @@
 
         window.loadTradeData = async function() {
             try {
-                const response = await fetch('trades.json');
+                const response = await fetch('/api/trades', { cache: 'no-store' });
                 const trades = await response.json();
                 
                 // Handle both array and object formats
