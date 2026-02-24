@@ -6,6 +6,7 @@ Strategies: AI Contrarian, Late Entry, TBO Trend, TBT Divergence, Execution Conf
 
 import requests
 import json
+import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import uuid
@@ -39,6 +40,10 @@ class PolymarketTraderV4:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "Mozilla/5.0"})
         self.session.timeout = 10
+
+        # Supabase write-path config (optional, server-side env)
+        self.supabase_url = os.getenv("SUPABASE_URL")
+        self.supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
         
         # Strategy starting capital: $100 each
         self.initial_capital = {
@@ -247,6 +252,8 @@ class PolymarketTraderV4:
         
         self.trades.append(position)
         self.save_trades()
+        # Dual-write: Supabase + local JSON (local already persisted above)
+        self.write_trade_to_supabase(position, event="open")
         return position
     
     def close_position(self, trade_id: str, exit_price: float) -> Optional[Dict]:
@@ -297,11 +304,53 @@ class PolymarketTraderV4:
                 
                 self.capital_state[strategy][timeframe] = state
                 self.save_capital_state()
+
+                # Dual-write close event to Supabase
+                self.write_trade_to_supabase(trade, event="close")
                 
                 return trade
         
         return None
     
+    def write_trade_to_supabase(self, trade: Dict, event: str = "upsert") -> bool:
+        """Write trade event to Supabase trades table. Non-fatal on failure."""
+        if not self.supabase_url or not self.supabase_service_role_key:
+            return False
+
+        try:
+            payload = {
+                "strategy": trade.get("strategy"),
+                "timeframe": trade.get("timeframe"),
+                "market": trade.get("market_id") or trade.get("question", "")[:120],
+                "side": "BUY",  # current strategy enters YES positions
+                "status": trade.get("status"),
+                "entry_price": trade.get("entry_price"),
+                "exit_price": trade.get("exit_price"),
+                "pnl": trade.get("pnl"),
+                "entry_time": trade.get("entry_time"),
+                "exit_time": trade.get("exit_time")
+            }
+
+            response = self.session.post(
+                f"{self.supabase_url}/rest/v1/trades",
+                headers={
+                    "apikey": self.supabase_service_role_key,
+                    "Authorization": f"Bearer {self.supabase_service_role_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal"
+                },
+                json=payload,
+                timeout=10
+            )
+
+            if not response.ok:
+                print(f"⚠️ Supabase write failed ({response.status_code}): {response.text[:180]}")
+                return False
+            return True
+        except Exception as e:
+            print(f"⚠️ Supabase write exception: {e}")
+            return False
+
     def record_loss(self, strategy: str):
         """Record loss for circuit breaker"""
         if strategy not in self.circuit_breaker_state:
@@ -435,8 +484,17 @@ Status: 🔴 LOCKED for 24 hours
             if not yes_price:
                 yes_price = self.get_market_price(market_id)
             
-            # Filter for specified timeframe
-            if not yes_price or timeframe not in question.lower():
+            # Filter for specified timeframe (prefer explicit field from discovery output)
+            market_tf = market.get("timeframe")
+            if market_tf:
+                if market_tf != timeframe:
+                    continue
+            else:
+                # Backward compatibility with legacy question-text tagging
+                if timeframe not in question.lower():
+                    continue
+
+            if not yes_price:
                 continue
             
             self.update_market_history(market_id, yes_price)
